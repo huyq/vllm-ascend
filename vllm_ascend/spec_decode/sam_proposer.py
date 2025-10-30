@@ -1,6 +1,7 @@
 from typing import Optional, Union, List
 from dataclasses import dataclass
 from copy import deepcopy
+import os
 import torch
 import numpy as np
 from numba import jit
@@ -127,6 +128,7 @@ class SAMProposer(Proposer):
         self.name = SpecDcodeType.SAM
         self.device = device
         self.runner = runner
+        self.speculative_auto_seqlen_thre = eval(os.environ.get('VLLM_SPECULATIVE_SEQ_LENGTH_THRE', "-1"))
     
     def propose(self,
                 request_id: int,
@@ -168,6 +170,9 @@ class SAMProposer(Proposer):
             
             # Add sampled_token_ids to token_ids_cpu.
             end_idx = self.runner.input_batch.num_tokens_no_spec[i]
+            if self.speculative_auto_seqlen_thre > 0 and end_idx > self.speculative_auto_seqlen_thre:
+                draft_token_ids.append([])
+                continue
             start_idx = end_idx - num_sampled_ids
 
             drafter_output = self.propose(
