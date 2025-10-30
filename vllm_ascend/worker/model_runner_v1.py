@@ -21,6 +21,7 @@ import copy
 import gc
 import itertools
 import time
+import os
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
@@ -339,6 +340,9 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                      MtpProposer]] = None
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
+        self.speculative_auto_switch = (os.environ.get('VLLM_SPECULATIVE_AUTO_SWITCH', "0")=="1")
+        self.speculative_auto_bs_thre = eval(os.environ.get('VLLM_SPECULATIVE_BATCH_SIZE_THRE', "32"))
+        self.speculative_switch_on = False
         if self.speculative_config:
             spec_token_num = self.speculative_config.num_speculative_tokens
             assert spec_token_num > 0
@@ -1262,15 +1266,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         ],
                                     dtype=np.int32)
 
-        if (self.use_aclgraph and total_num_scheduled_tokens
-                <= self.aclgraph_batch_sizes[-1]):
-            # Add padding to the batch size.
-            num_input_tokens = self.vllm_config.pad_for_cudagraph(
-                total_num_scheduled_tokens)
-        else:
-            # Eager mode.
-            num_input_tokens = total_num_scheduled_tokens
-
         # Get the attention state.
         attn_state = self._build_attn_state(num_reqs, num_scheduled_tokens,
                                             num_valid_tokens)
@@ -1280,6 +1275,34 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         with_prefill = attn_state not in [
             AscendAttentionState.DecodeOnly, AscendAttentionState.SpecDecoding
         ]
+
+        if self.speculative_config:
+            if self.speculative_auto_switch and num_reqs > self.speculative_auto_bs_thre:
+                self.use_spec_decode = False
+                self.speculative_switch_on = False
+            else:
+                self.speculative_switch_on = True
+
+        if with_prefill:
+            self.speculative_switch_on = True
+
+        if self.speculative_config and not self.speculative_switch_on:
+            num_scheduled_tokens = np.array([1 for _ in range(len(req_ids))], dtype=np.int32)
+            max_num_scheduled_tokens = max(num_scheduled_tokens)
+            attn_state = AscendAttentionState.DecodeOnly
+            total_num_scheduled_tokens = num_reqs
+            self.spec_attn_mask = None
+            self.spec_token_num = 0
+            self.decode_token_per_req = 1
+
+        if (self.use_aclgraph and total_num_scheduled_tokens
+                <= self.aclgraph_batch_sizes[-1]):
+            # Add padding to the batch size.
+            num_input_tokens = self.vllm_config.pad_for_cudagraph(
+                total_num_scheduled_tokens)
+        else:
+            # Eager mode.
+            num_input_tokens = total_num_scheduled_tokens
 
         self.query_lens = torch.from_numpy(num_scheduled_tokens)
         enable_dbo = self._check_dbo_is_valid(self.query_lens.tolist(),
@@ -1446,6 +1469,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         use_spec_decode = len(
             scheduler_output.scheduled_spec_decode_tokens) > 0
+        if self.speculative_config and not self.speculative_switch_on:
+            use_spec_decode = False
         if not use_spec_decode:
             # NOTE(woosuk): Due to chunked prefills, the batch may contain
             # partial requests. While we should not sample any token
@@ -1941,12 +1966,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         uniform_decode = (max_query_len == self.uniform_decode_query_len) and (
             scheduler_output.total_num_scheduled_tokens
             == self.input_batch.num_reqs * max_query_len)
+        if self.speculative_config and not self.speculative_switch_on:
+            uniform_decode = True
         batch_descriptor = BatchDescriptor(num_tokens=num_input_tokens,
                                            uniform_decode=uniform_decode)
         aclgraph_runtime_mode, batch_descriptor = \
             self.aclgraph_dispatcher.dispatch(batch_descriptor)
 
         # Run forward pass
+        total_num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        if self.speculative_config and not self.speculative_switch_on:
+            total_num_scheduled_tokens = self.input_batch.num_reqs
         with ProfileExecuteDuration().capture_async("forward"):
             with set_ascend_forward_context(
                     attn_metadata,
@@ -1958,8 +1988,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                     moe_comm_type=moe_comm_type,
                     aclgraph_runtime_mode=aclgraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
-                    num_actual_tokens=scheduler_output.
-                    total_num_scheduled_tokens,
+                    num_actual_tokens=total_num_scheduled_tokens,
                     prefetch_stream=self.prefetch_stream,
                     model_instance=self.model):
                 self.maybe_setup_kv_connector(scheduler_output)
@@ -2069,8 +2098,11 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             discard_sampled_tokens_req_indices = []
             for i, req_id in enumerate(self.input_batch.req_ids):
                 req_state = self.requests[req_id]
-                seq_len = (req_state.num_computed_tokens +
-                           scheduler_output.num_scheduled_tokens[req_id])
+                if self.speculative_config and not self.speculative_switch_on:
+                    seq_len = (req_state.num_computed_tokens + 1)
+                else:
+                    seq_len = (req_state.num_computed_tokens +
+                               scheduler_output.num_scheduled_tokens[req_id])
                 if seq_len < req_state.num_tokens:
                     # Ignore the sampled token.
                     # Rewind the generator state as if the token was not sampled.
