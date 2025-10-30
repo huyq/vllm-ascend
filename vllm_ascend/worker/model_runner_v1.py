@@ -911,6 +911,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         elif attn_state == AscendAttentionState.PrefillCacheHit:
             return self.attn_mask_builder.get_attn_mask(
                 128, self.dtype, self.device)
+        # Speculative decoding: same as chunked prefill
+        elif attn_state == AscendAttentionState.SpecDecoding:
+            return self.attn_mask_builder.get_splitfuse_attn_mask(
+                    seq_lens, position, self.dtype, self.device) 
         # Decode-only situation.
         else:
             return None

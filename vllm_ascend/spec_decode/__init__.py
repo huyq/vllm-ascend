@@ -19,11 +19,13 @@
 from vllm_ascend.spec_decode.eagle_proposer import EagleProposer
 from vllm_ascend.spec_decode.mtp_proposer import MtpProposer
 from vllm_ascend.spec_decode.ngram_proposer import NgramProposer
+from vllm_ascend.spec_decode.sam_proposer import SAMProposer
 
 
 def get_spec_decode_method(method, vllm_config, device, runner):
     if method == "ngram":
-        return NgramProposer(vllm_config, device, runner)
+        # return NgramProposer(vllm_config, device, runner)
+        return SAMProposer(vllm_config, device, runner)
     elif method in ["eagle", "eagle3"]:
         return EagleProposer(vllm_config, device, runner)
     elif method == 'deepseek_mtp':
